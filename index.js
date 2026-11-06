@@ -18,8 +18,8 @@
 "use strict";
 
 const fs = require("node:fs");
-const { readCache, writeCache, cacheFile, lockDir } = require("./lib/cache.js");
-const { acquire, release } = require("./lib/lock.js");
+const { readCache, writeCache, cacheDir, cacheFile, lockDir } = require("./lib/cache.js");
+const lock = require("./lib/lock.js"); // called through the module so a test can wrap acquire
 const { fetchUsage } = require("./lib/fetch.js");
 const { binding, expired } = require("./lib/parse.js");
 
@@ -51,10 +51,11 @@ function toResult(entry, source, now, extra = {}) {
     expired: expired(quota, now),
     rateLimited: !!extra.rateLimited,
     lastStatus: (entry && entry.lastStatus) || null,
+    reason: (entry && entry.lastReason) || null, // why the last attempt failed
   };
 }
 
-function none() {
+function none(fields = {}) {
   return {
     ok: false,
     quota: null,
@@ -66,12 +67,45 @@ function none() {
     expired: false,
     rateLimited: false,
     lastStatus: null,
+    reason: null,
+    ...fields,
   };
 }
 
-// Wait for the lock holder to finish ONE attempt (ok / 429 / miss all stamp
-// `lastAttemptAt`), then return the freshest cache. Poll-based so it works across
-// separate processes, not just in-process promises.
+// What a caller gets from an entry another process wrote: its reading if the
+// window still applies, otherwise nothing, with that attempt's status and reason.
+function fromOther(c, now, reasonIfNone) {
+  if (c && c.quota && !expired(c.quota, now)) {
+    return toResult(c, "cache-wait", now, { rateLimited: c.lastStatus === "rate_limited" });
+  }
+  return none({
+    rateLimited: !!c && c.lastStatus === "rate_limited",
+    lastStatus: (c && c.lastStatus) || null,
+    reason: (c && c.lastReason) || reasonIfNone || null,
+  });
+}
+
+// The cache folder exists and this process can write to it. Without that the
+// lock can never be taken, so say so instead of waiting on a lock nobody holds.
+function writable(dir) {
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.accessSync(dir, fs.constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Some process finished an attempt (ok / 429 / miss all stamp `lastAttemptAt`)
+// after the one this caller saw.
+function attemptedSince(entry, prevAttemptAt) {
+  return !!entry && Number.isFinite(entry.lastAttemptAt) && entry.lastAttemptAt > prevAttemptAt;
+}
+
+// Wait for the lock holder to finish ONE attempt, then return the freshest
+// cache as { entry, done }; `done` is false when the wait ran out first.
+// Poll-based so it works across separate processes, not just in-process promises.
 async function waitForAttempt(dir, prevAttemptAt, waitMs) {
   const file = cacheFile(dir);
   const deadline = Date.now() + waitMs;
@@ -82,16 +116,16 @@ async function waitForAttempt(dir, prevAttemptAt, waitMs) {
     } catch {
       /* not written yet */
     }
-    if (entry && Number.isFinite(entry.lastAttemptAt) && entry.lastAttemptAt > prevAttemptAt) {
-      return entry;
-    }
+    if (attemptedSince(entry, prevAttemptAt)) return { entry, done: true };
     await sleep(80);
   }
+  let entry = null;
   try {
-    return JSON.parse(fs.readFileSync(file, "utf8"));
+    entry = JSON.parse(fs.readFileSync(file, "utf8"));
   } catch {
-    return null;
+    /* nothing cached */
   }
+  return { entry, done: attemptedSince(entry, prevAttemptAt) };
 }
 
 // readUsage(opts) → Promise<Result>
@@ -118,13 +152,24 @@ async function readUsage(opts = {}) {
   }
   // 2) Offline — never touch the network; serve cache or nothing.
   if (offline) {
-    return usableCache ? toResult(cache, "cache", now) : none();
+    return usableCache ? toResult(cache, "cache", now) : none({ reason: "no-cache" });
+  }
+  // A cache folder that cannot be written means no lock and no shared reading.
+  if (!writable(cacheDir(dir))) {
+    return usableCache ? toResult(cache, "cache", now) : none({ reason: "cache-dir" });
   }
 
-  const lock = lockDir(dir);
+  const lockPath = lockDir(dir);
+  const prevAttempt = (cache && cache.lastAttemptAt) || 0;
   // 3) Single-flight: only the lock holder hits the endpoint.
-  if (acquire(lock, { staleMs: timeoutMs + 7_000, now })) {
+  if (lock.acquire(lockPath, { staleMs: timeoutMs + 7_000, now })) {
     try {
+      // Another process may have finished its read and released the lock
+      // between our readCache() and this acquire. Use its result rather than
+      // make a second request.
+      const latest = readCache(dir);
+      if (attemptedSince(latest, prevAttempt)) return fromOther(latest, now);
+
       const r = await fetchUsage({ timeoutMs, ...seams });
       const at = Date.now();
       if (r.status === "ok") {
@@ -134,26 +179,22 @@ async function readUsage(opts = {}) {
       }
       // 429 or miss — preserve the last good quota + its fetchedAt; only stamp
       // the attempt so waiters are released and we can flag "held / last known".
+      const reason = r.reason || null;
       const entry = cache
-        ? { ...cache, lastStatus: r.status, lastAttemptAt: at }
-        : { fetchedAt: null, quota: null, lastStatus: r.status, lastAttemptAt: at };
+        ? { ...cache, lastStatus: r.status, lastReason: reason, lastAttemptAt: at }
+        : { fetchedAt: null, quota: null, lastStatus: r.status, lastReason: reason, lastAttemptAt: at };
       writeCache(entry, dir);
       const rateLimited = r.status === "rate_limited";
       if (usableCache) return toResult(entry, "cache", now, { rateLimited });
-      return { ...none(), rateLimited, lastStatus: r.status };
+      return none({ rateLimited, lastStatus: r.status, reason });
     } finally {
-      release(lock);
+      lock.release(lockPath);
     }
   }
 
   // 4) Another process is fetching — wait briefly for its result, then serve cache.
-  const prevAttempt = (cache && cache.lastAttemptAt) || 0;
-  const fresh = await waitForAttempt(dir, prevAttempt, waitMs);
-  const c = fresh || cache;
-  const use = c && c.quota && !expired(c.quota, now);
-  return use
-    ? toResult(c, "cache-wait", now, { rateLimited: c.lastStatus === "rate_limited" })
-    : none();
+  const { entry, done } = await waitForAttempt(dir, prevAttempt, waitMs);
+  return fromOther(entry || cache, now, done ? null : "busy");
 }
 
 module.exports = { readUsage, binding, expired, STALE_MS, DEFAULT_TTL_MS };

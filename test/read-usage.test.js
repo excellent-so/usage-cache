@@ -126,3 +126,81 @@ test("force: bypasses a fresh cache and re-reads (still single-flight)", async (
   assert.equal(r.quota.fiveHour.pct, 77);
   assert.equal(r.source, "network");
 });
+
+test("SINGLE-FLIGHT RACE: a read that lands between our cache read and our lock is reused, not repeated", async () => {
+  const dir = tmpDir();
+  const old = Date.now() - 5 * 60_000;
+  writeCache(
+    { fetchedAt: old, quota: { fiveHour: { pct: 30, resetsAt: Date.parse(FUTURE()) }, sevenDay: null, scoped: [] }, lastStatus: "ok", lastAttemptAt: old },
+    dir,
+  );
+  // Simulate another process that finished its read and released the lock
+  // just before this caller takes it.
+  const lock = require("../lib/lock.js");
+  const realAcquire = lock.acquire;
+  lock.acquire = (...args) => {
+    const at = Date.now();
+    writeCache(
+      { fetchedAt: at, quota: { fiveHour: { pct: 55, resetsAt: Date.parse(FUTURE()) }, sevenDay: null, scoped: [] }, lastStatus: "ok", lastAttemptAt: at },
+      dir,
+    );
+    return realAcquire(...args);
+  };
+  try {
+    const { impl, state } = countingFetch(0, 99);
+    const r = await readUsage({ cacheDir: dir, tokenReader: TOKEN, fetchImpl: impl, ttlMs: 60_000 });
+    assert.equal(state.calls, 0, "no second request");
+    assert.equal(r.quota.fiveHour.pct, 55, "the other process's reading");
+    assert.equal(fs.existsSync(path.join(dir, "fetch.lock")), false, "lock released");
+  } finally {
+    lock.acquire = realAcquire;
+  }
+});
+
+test("REASON: a failed read says why, in the result and for waiters", async () => {
+  const dir = tmpDir();
+  const unauthorized = async () => ({ ok: false, status: 401, json: async () => ({}) });
+  const r = await readUsage({ cacheDir: dir, tokenReader: TOKEN, fetchImpl: unauthorized });
+  assert.equal(r.ok, false);
+  assert.equal(r.lastStatus, "miss");
+  assert.equal(r.reason, "http-401");
+
+  const noToken = await readUsage({ cacheDir: tmpDir(), tokenReader: async () => null, fetchImpl: unauthorized });
+  assert.equal(noToken.reason, "no-token");
+
+  const timedOut = await readUsage({
+    cacheDir: tmpDir(),
+    tokenReader: async () => ({ token: null, reason: "keychain-timeout" }),
+    fetchImpl: unauthorized,
+  });
+  assert.equal(timedOut.reason, "keychain-timeout");
+
+  const limited = await readUsage({ cacheDir: tmpDir(), tokenReader: TOKEN, fetchImpl: async () => ({ ok: false, status: 429 }) });
+  assert.equal(limited.rateLimited, true);
+  assert.equal(limited.reason, "http-429");
+
+  const offline = await readUsage({ cacheDir: tmpDir(), offline: true });
+  assert.equal(offline.reason, "no-cache");
+});
+
+test("REASON: a good read clears the last failure's reason", async () => {
+  const dir = tmpDir();
+  await readUsage({ cacheDir: dir, tokenReader: TOKEN, fetchImpl: async () => ({ ok: false, status: 503 }) });
+  const { impl } = countingFetch(0, 20);
+  const r = await readUsage({ cacheDir: dir, tokenReader: TOKEN, fetchImpl: impl });
+  assert.equal(r.ok, true);
+  assert.equal(r.reason, null);
+});
+
+test("UNWRITABLE CACHE: says so at once instead of waiting on a lock nobody holds", async () => {
+  const parent = tmpDir();
+  const file = path.join(parent, "not-a-dir");
+  fs.writeFileSync(file, "x");
+  const { impl, state } = countingFetch(0);
+  const t0 = Date.now();
+  const r = await readUsage({ cacheDir: path.join(file, "cache"), tokenReader: TOKEN, fetchImpl: impl, waitMs: 3_000 });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "cache-dir");
+  assert.equal(state.calls, 0, "no uncached request");
+  assert.ok(Date.now() - t0 < 1_000, "did not wait out waitMs");
+});

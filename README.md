@@ -57,21 +57,30 @@ This package makes them share one read:
 ## CLI
 
 ```sh
-usage-cache                 # "34%", the 5-hour session figure
+usage-cache                 # "34%", the 5-hour session figure (same as --pct)
 usage-cache --statusline    # "34% (5h) · wk 61%"
 usage-cache --json          # the full result object
 usage-cache --binding       # headline = the hottest window (5-hour, weekly or per-model)
-usage-cache --offline       # serve the cache only, never call the endpoint
+usage-cache --offline       # serve the cache only, never call the endpoint (alias --no-network)
 usage-cache --force         # skip the TTL and refresh now (still single flight)
 usage-cache --ttl 30        # cache freshness window, in seconds (default 60)
 usage-cache --wait 3000     # how long to wait for another process's read, in ms
+usage-cache --help          # the options; --version prints the version
 ```
 
-A reading over 15 minutes old prints with a leading `~` (for example `~30%`).
-With no reading at all it prints `-`.
+When the endpoint returns no 5-hour figure, the headline is the weekly one and
+`--statusline` prints it once, labelled: `43% (wk)`. With `--binding`, the
+label names the window the headline came from, for example `80% (Opus) · wk 61%`.
 
-It always exits 0, even when the read fails, so it is safe to use as a
-statusline command or in a shell prompt.
+A reading over 15 minutes old prints with a leading `~` (for example `~30%`).
+With no reading at all it prints `-`. If you run it by hand in a terminal, it
+also prints one line to stderr saying why (no Claude Code login, HTTP 401, no
+network, and so on) and what to do. A statusline or a `$(usage-cache)` prompt
+never sees that line; `--json` carries the same cause in `reason`.
+
+A failed read still exits 0, so it is safe to use as a statusline command or in
+a shell prompt. Only an unknown option or a bad `--ttl` or `--wait` value exits
+2, with a one-line message.
 
 ### Claude Code statusline
 
@@ -85,8 +94,18 @@ the endpoint per interval.
 
 ## Library
 
+The package is CommonJS. From CommonJS:
+
 ```js
 const { readUsage } = require("@excellent-so/usage-cache");
+
+readUsage().then((res) => console.log(res.binding));
+```
+
+From an ES module, named imports work too:
+
+```js
+import { readUsage } from "@excellent-so/usage-cache";
 
 const res = await readUsage();
 // {
@@ -99,8 +118,15 @@ const res = await readUsage();
 //   rateLimited: false,  // the last attempt got HTTP 429
 //   expired: false,      // the window has reset, so pct no longer applies
 //   lastStatus: "ok",    // "ok" | "rate_limited" | "miss" | null
+//   reason: null,        // why the last attempt failed, null when it worked
 // }
 ```
+
+`reason` is one of `no-token` (no Claude Code login found),
+`keychain-timeout`, `http-401` (or any other `http-NNN`), `network`,
+`bad-json`, `empty`, `cache-dir` (the cache folder cannot be written),
+`no-cache` (offline with nothing cached) or `busy` (another process was still
+reading when `waitMs` ran out).
 
 `pct` is a percent, as the endpoint returns it: 0 to 100, and above 100 when
 you are over a limit. `resetsAt` and `fetchedAt` are epoch milliseconds.
@@ -127,7 +153,8 @@ two places:
 - **macOS:** the Keychain item `Claude Code-credentials`, read with
   `/usr/bin/security find-generic-password`. The lookup gives up after 4
   seconds (for example, while a Keychain access prompt is open). If it fails or
-  times out, the file below is tried.
+  times out, the file below is tried. If that has no token either, the result's
+  `reason` is `keychain-timeout`.
 - **Linux and other platforms:** `~/.claude/.credentials.json`.
 
 Both hold the same JSON, and the token is `claudeAiOauth.accessToken`. It is
@@ -155,6 +182,17 @@ One read-only GET, to `api.anthropic.com` only. This package sets two headers,
 `Authorization: Bearer <your token>` and `anthropic-beta: oauth-2025-04-20`,
 and sends no body. There is no telemetry and no other host. The token is read
 for the request and then dropped: never logged, never written to disk.
+
+## Uninstall
+
+```sh
+npm rm -g @excellent-so/usage-cache
+rm -rf ~/.cache/excellent-usage-cache
+```
+
+The second line removes the shared cache (use your `$EXCELLENT_USAGE_CACHE_DIR`
+or `$XDG_CACHE_HOME/excellent-usage-cache` if you set one). Remove the
+`statusLine` entry from `~/.claude/settings.json` if you added it.
 
 ## Contributing
 
