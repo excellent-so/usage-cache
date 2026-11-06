@@ -1,0 +1,47 @@
+{
+  "name": "@excellent-so/usage-cache",
+  "version": "0.1.1",
+  "description": "Single-flight, file-cached reader for the Anthropic OAuth usage endpoint. Collapses many local clients (Claude Code statuslines, dev shells, menu bars) onto ONE network read per interval so they stop tripping the per-token rate limit.",
+  "type": "commonjs",
+  "main": "index.js",
+  "bin": {
+    "usage-cache": "bin/cli.js"
+  },
+  "files": [
+    "index.js",
+    "lib/",
+    "bin/",
+    "README.md",
+    "CHANGELOG.md",
+    "SECURITY.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test",
+    "test:standalone": "node scripts/standalone-check.mjs"
+  },
+  "keywords": [
+    "anthropic",
+    "claude",
+    "claude-code",
+    "usage",
+    "rate-limit",
+    "oauth",
+    "cache",
+    "single-flight",
+    "statusline"
+  ],
+  "author": "Excellent <matt@excellent.so>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/excellent-so/usage-cache.git"
+  },
+  "homepage": "https://github.com/excellent-so/usage-cache#readme",
+  "bugs": {
+    "url": "https://github.com/excellent-so/usage-cache/issues"
+  }
+}
