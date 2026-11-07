@@ -6,6 +6,8 @@ One shared, file-cached read of your Claude plan usage. Every Claude Code
 statusline, dev shell and menu-bar meter on your machine reads the same cache,
 so together they make one request per interval.
 
+Docs and how to use it: https://playbook.excellent.so/usage-cache
+
 Zero dependencies. Node 18 or later. MIT license.
 
 > **Unofficial.** This package reads an undocumented Anthropic endpoint
